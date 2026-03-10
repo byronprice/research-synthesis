@@ -179,7 +179,7 @@ class PaperSummarizer:
             try:
                 response = self.client.messages.create(
                     model=self.model,
-                    max_tokens=2048,
+                    max_tokens=4096,
                     system=SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": user_content}],
                 )
