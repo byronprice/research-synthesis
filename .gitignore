@@ -1,0 +1,29 @@
+# Extracted paper text and generated data (large + copyright-sensitive)
+data/
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Environments
+.env
+.venv/
+env/
+
+# Model outputs and checkpoints
+outputs/
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/

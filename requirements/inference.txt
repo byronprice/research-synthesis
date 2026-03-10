@@ -1,0 +1,8 @@
+# Install base.txt first, then this file for local M1 inference
+-r base.txt
+
+# Apple Silicon native inference
+mlx-lm>=0.16.0
+
+# Web UI
+chainlit>=1.1.0

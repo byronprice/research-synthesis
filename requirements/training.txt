@@ -1,0 +1,11 @@
+# Install base.txt first, then this file on the GPU cluster
+-r base.txt
+
+# Fine-tuning (install via pip on cluster)
+unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
+trl>=0.8.6
+peft>=0.11.0
+bitsandbytes>=0.43.0
+datasets>=2.19.0
+transformers>=4.41.0
+accelerate>=0.30.0

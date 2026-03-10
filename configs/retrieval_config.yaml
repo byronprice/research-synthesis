@@ -1,0 +1,29 @@
+embedding:
+  model: "nomic-ai/nomic-embed-text-v1.5"
+  batch_size: 64
+  # Prefix required by nomic-embed-text for retrieval use
+  query_prefix: "search_query: "
+  document_prefix: "search_document: "
+
+qdrant:
+  path: "data/qdrant_db"
+  collection_dense: "papers_dense"
+  vector_size: 768
+  # Number of chunks per paper to index
+  # level0=abstract, level1=sections, level2=paragraphs
+  chunk_levels: [0, 1, 2]
+
+chunking:
+  # Level 1: target tokens per section chunk
+  section_target_tokens: 600
+  section_max_tokens: 900
+  # Level 2: paragraph chunk size when section exceeds section_max_tokens
+  paragraph_target_tokens: 300
+  paragraph_overlap_tokens: 50
+
+retrieval:
+  # Initial dense retrieval candidates
+  top_k_dense: 40
+  # After cross-encoder reranking
+  top_k_reranked: 8
+  reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"

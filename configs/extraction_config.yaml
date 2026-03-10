@@ -1,0 +1,39 @@
+zotero:
+  db_path: "~/Zotero/zotero.sqlite"
+  storage_path: "~/Zotero/storage"
+
+output:
+  metadata_jsonl: "data/extracted/papers_metadata.jsonl"
+  fulltext_jsonl: "data/extracted/papers_fulltext.jsonl"
+
+extraction:
+  # Max seconds per PDF before skipping (large image-heavy PDFs can stall)
+  timeout_seconds: 60
+  # Min text length to consider extraction successful
+  min_text_chars: 500
+  # Section headers to detect (case-insensitive)
+  section_headers:
+    - abstract
+    - introduction
+    - background
+    - related work
+    - methods
+    - materials and methods
+    - experimental procedures
+    - methodology
+    - results
+    - experiments
+    - discussion
+    - conclusion
+    - conclusions
+    - summary
+    - acknowledgments
+    - references
+    - supplementary
+    - supplemental
+  # Strip reference section text from full_text
+  strip_references: true
+  # Max chars to store per section (avoid bloat from very long results sections)
+  max_section_chars: 8000
+  # Max chars for full_text field
+  max_fulltext_chars: 40000
