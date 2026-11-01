@@ -71,8 +71,8 @@ class ZoteroReader:
     """
 
     def __init__(self, db_path: str, storage_path: str):
-        self.db_path = Path(db_path)
-        self.storage_path = Path(storage_path)
+        self.db_path = Path(db_path).expanduser()
+        self.storage_path = Path(storage_path).expanduser()
 
         if not self.db_path.exists():
             raise FileNotFoundError(f"Zotero database not found: {self.db_path}")

@@ -26,39 +26,74 @@ from loguru import logger
 SYSTEM_PROMPT = """\
 You are a neuroscience literature analyst. Synthesize a cluster of related papers
 to identify consensus, trends, disagreements, and open questions.
-Be precise, use field terminology, and cite papers by (Author, Year) when relevant.
-Return only the JSON object requested — no preamble or markdown fences."""
+Be precise, use field terminology, and cite papers by (Author, Year) when relevant."""
 
 META_PROMPT_TEMPLATE = """\
 Synthesize this cluster of {n} neuroscience papers on the topic of {topic}.
 
 PAPER SUMMARIES:
-{summaries_text}
+{summaries_text}"""
 
-Return a JSON object:
-{{
-  "topic_label": "concise label for this cluster (5-10 words)",
-  "consensus": ["agreed-upon finding 1", "agreed-upon finding 2", ...],
-  "trends": ["how understanding has evolved chronologically"],
-  "contradictions": [
-    {{
-      "description": "brief description of the contradiction",
-      "papers_for": ["Author Year", ...],
-      "papers_against": ["Author Year", ...]
-    }}
-  ],
-  "open_questions": ["unresolved question 1", ...],
-  "methodology_notes": "common methods; any method-specific disagreements",
-  "representative_papers": ["most central/impactful titles in this cluster"],
-  "keywords": ["keyword1", ...]
-}}"""
+META_SYNTHESIS_TOOL = {
+    "name": "synthesize_cluster",
+    "description": "Synthesize a cluster of neuroscience papers into a structured meta-summary",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "topic_label": {
+                "type": "string",
+                "description": "Concise label for this cluster (5-10 words)",
+            },
+            "consensus": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Agreed-upon findings across papers in this cluster",
+            },
+            "trends": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "How understanding of this topic has evolved chronologically",
+            },
+            "contradictions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "papers_for": {"type": "array", "items": {"type": "string"}},
+                        "papers_against": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["description", "papers_for", "papers_against"],
+                },
+            },
+            "open_questions": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "methodology_notes": {
+                "type": "string",
+                "description": "Common methods and any method-specific disagreements",
+            },
+            "representative_papers": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Most central or impactful paper titles in this cluster",
+            },
+            "keywords": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["topic_label", "consensus", "trends", "open_questions", "keywords"],
+    },
+}
 
 
 class MetaSummarizer:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "claude-haiku-4-5-20251001",
+        model: str = "claude-sonnet-4-6",
         max_papers_per_call: int = 20,
         retry_delay: float = 5.0,
     ):
@@ -172,20 +207,21 @@ class MetaSummarizer:
             try:
                 response = self.client.messages.create(
                     model=self.model,
-                    max_tokens=2048,
+                    max_tokens=4096,
                     system=SYSTEM_PROMPT,
+                    tools=[META_SYNTHESIS_TOOL],
+                    tool_choice={"type": "tool", "name": "synthesize_cluster"},
                     messages=[{"role": "user", "content": user_content}],
                 )
-                raw = response.content[0].text.strip()
-                if raw.startswith("```"):
-                    raw = raw.split("```")[1]
-                    if raw.startswith("json"):
-                        raw = raw[4:]
-                result = json.loads(raw)
-                result["cluster_id"] = cluster_id
-                result["paper_count"] = len(papers)
-                result["paper_ids"] = [p["paper_id"] for p in papers]
-                return result
+                for block in response.content:
+                    if block.type == "tool_use":
+                        result = dict(block.input)
+                        result["cluster_id"] = cluster_id
+                        result["paper_count"] = len(papers)
+                        result["paper_ids"] = [p.get("paper_id") for p in papers if p.get("paper_id")]
+                        return result
+                logger.warning(f"Cluster {cluster_id}: no tool_use block in response")
+                return None
             except anthropic.RateLimitError:
                 time.sleep(self.retry_delay * (2 ** attempt))
             except Exception as e:

@@ -36,7 +36,17 @@ class MethodsInfo(BaseModel):
 class Claim(BaseModel):
     claim: str = Field(description="A single specific empirical claim made by the paper")
     direction: str = Field(
-        description="Direction: increase | decrease | no_effect | bidirectional | unclear"
+        description=(
+            "Direction of the claim: "
+            "increase (a quantity goes up), "
+            "decrease (a quantity goes down), "
+            "no_effect (manipulation has no effect), "
+            "bidirectional (both increases and decreases reported), "
+            "mechanistic (describes a causal mechanism without a quantitative direction), "
+            "correlational (reports a correlation or association, not a manipulation), "
+            "computational (result from a model or simulation, not a direct experiment), "
+            "unclear (direction cannot be determined)"
+        )
     )
     quantitative: str = Field(
         default="", description="Quantitative details if available (e.g. '37%, p<0.01')"
@@ -56,6 +66,7 @@ class PaperSummary(BaseModel):
     title: str
     year: str
     journal: str
+    relevance: str = Field(description="1-3 sentences on the paper's significance and relationship to the broader literature")
     key_findings: list[str] = Field(description="3-7 key empirical findings")
     methods: MethodsInfo
     claims: list[Claim] = Field(description="2-6 specific directional claims")
@@ -67,12 +78,13 @@ class PaperSummary(BaseModel):
 # ── Prompt ──────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are an expert neuroscience research assistant. Your task is to extract \
-structured information from a neuroscience paper. Be precise and factual. \
-Do not infer findings not stated in the text. Use neuroscience field terminology.
-
-Return ONLY a JSON object matching the requested schema — no preamble, \
-no explanation, no markdown fences."""
+You are an expert neuroscience researcher. Extract structured information from \
+neuroscience papers. Be precise and factual. Do not infer findings not stated in \
+the text. Be aware of 1) methodological limitations, 2) claims that extend beyond \
+the evidence provided, and 3) the relevance of the paper to the broader scientific \
+literature. Use neuroscience terminology, but avoid excessive jargon. Always spell \
+out abbreviations in full on first use (e.g. write "mitral cells (MCs)" not just \
+"MCs"). Summaries must be self-contained and readable without the original paper."""
 
 USER_PROMPT_TEMPLATE = """\
 Extract structured information from this neuroscience paper.
@@ -84,32 +96,77 @@ COLLECTIONS: {collections}
 ABSTRACT:
 {abstract}
 
-RESULTS (excerpt):
+INTRODUCTION:
+{introduction}
+
+RESULTS:
 {results}
 
-DISCUSSION (excerpt):
-{discussion}
+DISCUSSION:
+{discussion}"""
 
-Return a JSON object with this exact structure:
-{{
-  "key_findings": ["finding 1", "finding 2", ...],
-  "methods": {{
-    "model_system": "mouse|rat|human|non-human_primate|in_vitro|computational|other",
-    "techniques": ["calcium imaging", "patch clamp", ...],
-    "analysis": ["dimensionality reduction", "GLM", ...]
-  }},
-  "claims": [
-    {{
-      "claim": "specific empirical claim",
-      "direction": "increase|decrease|no_effect|bidirectional|unclear",
-      "quantitative": "37% increase (p<0.01)",
-      "conditions": "head-fixed mice, visual stimulation"
-    }}
-  ],
-  "limitations": ["limitation 1", ...],
-  "open_questions": ["question 1", ...],
-  "keywords": ["keyword1", "keyword2", ...]
-}}"""
+# Tool definition — forces the API to return structurally valid JSON
+EXTRACT_TOOL = {
+    "name": "extract_paper_info",
+    "description": "Extract structured information from a neuroscience paper",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "key_findings": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "3-7 key empirical findings",
+            },
+            "methods": {
+                "type": "object",
+                "properties": {
+                    "model_system": {
+                        "type": "string",
+                        "description": "mouse|rat|human|non-human_primate|in_vitro|computational|other",
+                    },
+                    "techniques": {"type": "array", "items": {"type": "string"}},
+                    "analysis": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["model_system", "techniques", "analysis"],
+            },
+            "claims": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "claim": {"type": "string"},
+                        "direction": {
+                            "type": "string",
+                            "description": (
+                                "increase | decrease | no_effect | bidirectional | "
+                                "mechanistic (causal mechanism, no quantitative direction) | "
+                                "correlational (association/correlation, not a manipulation) | "
+                                "computational (model/simulation result) | "
+                                "unclear"
+                            ),
+                        },
+                        "quantitative": {"type": "string"},
+                        "conditions": {"type": "string"},
+                    },
+                    "required": ["claim", "direction", "quantitative", "conditions"],
+                },
+                "description": "2-6 specific directional claims",
+            },
+            "relevance": {
+                "type": "string",
+                "description": "1-3 sentences on the paper's significance and relationship to the broader literature",
+            },
+            "limitations": {"type": "array", "items": {"type": "string"}},
+            "open_questions": {"type": "array", "items": {"type": "string"}},
+            "keywords": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "5-10 domain keywords",
+            },
+        },
+        "required": ["key_findings", "methods", "claims", "limitations", "keywords", "relevance"],
+    },
+}
 
 
 # ── Summarizer ───────────────────────────────────────────────────────────────
@@ -125,7 +182,7 @@ class PaperSummarizer:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "claude-haiku-4-5-20251001",
+        model: str = "claude-sonnet-4-6",
         max_retries: int = 3,
         retry_delay: float = 5.0,
     ):
@@ -146,13 +203,14 @@ class PaperSummarizer:
 
         # Prefer Zotero abstract; fall back to extracted
         abstract = paper_meta.get("abstract", "") or sections.get("abstract", "")
-        results = sections.get("results", "")[:3000]
-        discussion = sections.get("discussion", "")[:2000]
+        introduction = sections.get("introduction", sections.get("intro", ""))
+        results = sections.get("results", "")
+        discussion = sections.get("discussion", "")
 
         # If we have neither results nor discussion, try full_text excerpt
         if not results and not discussion:
             full_text = fulltext_rec.get("full_text", "")
-            results = full_text[len(abstract):len(abstract) + 3000]
+            results = full_text[len(abstract):]
 
         if not abstract and not results:
             logger.warning(f"Paper {pid}: no usable text, skipping")
@@ -163,27 +221,36 @@ class PaperSummarizer:
             journal=paper_meta.get("journal", "Unknown"),
             year=paper_meta.get("year", "Unknown"),
             collections=", ".join(paper_meta.get("collections", [])) or "Uncategorized",
-            abstract=abstract[:2000],
+            abstract=abstract,
+            introduction=introduction,
             results=results,
             discussion=discussion,
         )
 
-        raw_json = self._call_api(user_content, pid)
-        if raw_json is None:
+        data = self._call_api(user_content, pid)
+        if data is None:
             return None
 
-        return self._parse_response(raw_json, paper_meta)
+        return self._build_summary(data, paper_meta)
 
-    def _call_api(self, user_content: str, paper_id: int) -> Optional[str]:
+    def _call_api(self, user_content: str, paper_id: int) -> Optional[dict]:
+        """Call Claude with tool use to get guaranteed-valid structured JSON."""
         for attempt in range(self.max_retries):
             try:
                 response = self.client.messages.create(
                     model=self.model,
                     max_tokens=4096,
                     system=SYSTEM_PROMPT,
+                    tools=[EXTRACT_TOOL],
+                    tool_choice={"type": "tool", "name": "extract_paper_info"},
                     messages=[{"role": "user", "content": user_content}],
                 )
-                return response.content[0].text
+                # tool_choice forces the first content block to be a tool_use block
+                for block in response.content:
+                    if block.type == "tool_use":
+                        return block.input  # already a parsed dict
+                logger.warning(f"Paper {paper_id}: no tool_use block in response")
+                return None
             except anthropic.RateLimitError:
                 wait = self.retry_delay * (2 ** attempt)
                 logger.warning(f"Rate limit hit for paper {paper_id}. Waiting {wait}s...")
@@ -194,26 +261,14 @@ class PaperSummarizer:
         logger.error(f"Failed to summarize paper {paper_id} after {self.max_retries} attempts")
         return None
 
-    def _parse_response(self, raw: str, meta: dict) -> Optional[PaperSummary]:
-        # Strip any accidental markdown fences
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as e:
-            logger.warning(f"JSON parse error for paper {meta['paper_id']}: {e}")
-            return None
-
+    def _build_summary(self, data: dict, meta: dict) -> Optional[PaperSummary]:
         try:
             return PaperSummary(
                 paper_id=meta["paper_id"],
                 title=meta.get("title", ""),
                 year=meta.get("year", ""),
                 journal=meta.get("journal", ""),
+                relevance=data.get("relevance", ""),
                 key_findings=data.get("key_findings", []),
                 methods=MethodsInfo(**data.get("methods", {"model_system": "other", "techniques": [], "analysis": []})),
                 claims=[Claim(**c) for c in data.get("claims", [])],

@@ -72,8 +72,7 @@ class ExtractionResult:
 class ExtractorConfig:
     timeout_seconds: int = 60
     min_text_chars: int = 500
-    max_section_chars: int = 8000
-    max_fulltext_chars: int = 40000
+    max_fulltext_chars: int = 120000
     strip_references: bool = True
 
 
@@ -208,9 +207,14 @@ class PDFExtractor:
         """
         Walk through blocks and assign text to sections based on detected headers.
         Returns {section_key: text}.
+
+        Text that appears before the first recognised header is collected as
+        "_preamble" and promoted to "results" if no results section is found
+        (handles Nature-style papers that use custom subsection names instead
+        of canonical "Results" / "Methods" headers).
         """
         sections: dict[str, list[str]] = {}
-        current_section: Optional[str] = None
+        current_section: Optional[str] = "_preamble"
         past_references = False
 
         for block in blocks:
@@ -232,10 +236,37 @@ class PDFExtractor:
             if current_section:
                 sections.setdefault(current_section, []).append(text)
 
-        return {k: "\n".join(v).strip() for k, v in sections.items()}
+        result = {k: "\n".join(v).strip() for k, v in sections.items()}
+
+        # Promote preamble to "results" when no canonical results section found.
+        # This handles journals (Nature, Science, Cell) that use named subsections
+        # instead of a top-level "Results" header.
+        preamble = result.pop("_preamble", "")
+        if "results" not in result and len(preamble) > 500:
+            result["results"] = preamble
+
+        return result
 
     def _truncate_sections(self, sections: dict[str, str]) -> dict[str, str]:
-        return {k: v[: self.config.max_section_chars] for k, v in sections.items()}
+        total = sum(len(v) for v in sections.values())
+        if total <= self.config.max_fulltext_chars:
+            return sections
+        # Water-filling: find threshold T so that capping all sections at T
+        # brings the total to max_fulltext_chars. Small sections stay untouched.
+        budget = self.config.max_fulltext_chars
+        lengths = sorted(len(v) for v in sections.values())
+        n = len(lengths)
+        remaining = budget
+        threshold = float(budget)
+        for i, length in enumerate(lengths):
+            candidate_t = remaining / (n - i)
+            if candidate_t >= length:
+                remaining -= length
+            else:
+                threshold = candidate_t
+                break
+        cap = int(threshold)
+        return {k: v[:cap] if len(v) > cap else v for k, v in sections.items()}
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ Usage:
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from loguru import logger
@@ -61,13 +62,16 @@ class RAGChain:
         model_path: Optional[str] = None,
         claude_model: str = "claude-haiku-4-5-20251001",
         top_k_dense: int = 40,
-        top_k_reranked: int = 8,
+        top_k_reranked: int = 12,
+        reviews_dir: str = "data/reviews",
     ):
         self.retriever = retriever
         self.reranker = reranker
         self.backend = backend
         self.top_k_dense = top_k_dense
         self.top_k_reranked = top_k_reranked
+        self.reviews_dir = Path(reviews_dir)
+        self._quality_scores: Optional[dict[int, int]] = None  # loaded lazily
 
         if backend == "claude":
             import anthropic
@@ -92,8 +96,10 @@ class RAGChain:
           contradiction — emphasize conflicting findings in the answer
           litreview    — generate an academic literature review paragraph
         """
-        # 1. Retrieve
-        chunks = self.retriever.retrieve(question, top_k=self.top_k_dense, filters=filters)
+        # 1. Retrieve — use more chunks for litreview
+        dense_k = self.top_k_dense * 2 if mode == "litreview" else self.top_k_dense
+        rerank_k = max(20, self.top_k_reranked) if mode == "litreview" else self.top_k_reranked
+        chunks = self.retriever.retrieve(question, top_k=dense_k, filters=filters)
         if not chunks:
             return RAGResult(
                 answer="No relevant papers found for this query.",
@@ -102,7 +108,11 @@ class RAGChain:
             )
 
         # 2. Rerank
-        top_chunks = self.reranker.rerank(question, chunks, top_k=self.top_k_reranked)
+        top_chunks = self.reranker.rerank(question, chunks, top_k=rerank_k)
+
+        # 2b. In litreview mode, boost scores by paper quality and re-sort
+        if mode == "litreview":
+            top_chunks = self._apply_quality_boost(top_chunks)
 
         # 3. Assemble context
         context = self._format_context(top_chunks)
@@ -114,6 +124,52 @@ class RAGChain:
 
         return RAGResult(answer=answer, sources=sources, query=question)
 
+    def _load_quality_scores(self) -> dict[int, int]:
+        """Load {paper_id: quality_score} from data/reviews/ lazily."""
+        if self._quality_scores is not None:
+            return self._quality_scores
+        scores = {}
+        if self.reviews_dir.exists():
+            for fpath in self.reviews_dir.glob("*.json"):
+                try:
+                    with open(fpath) as f:
+                        r = json.load(f)
+                    pid = r.get("paper_id")
+                    score = r.get("quality_score")
+                    if pid is not None and score is not None:
+                        scores[int(pid)] = int(score)
+                except Exception:
+                    pass
+        self._quality_scores = scores
+        logger.info(f"Loaded quality scores for {len(scores)} papers")
+        return scores
+
+    def _apply_quality_boost(self, chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
+        """
+        Re-score chunks by multiplying rerank score by a quality factor.
+        Quality 3 (average) = neutral (×1.0). Scale: score/3.
+        Papers with no review are treated as average (score 3).
+        """
+        scores = self._load_quality_scores()
+        if not scores:
+            return chunks
+        boosted = []
+        for c in chunks:
+            quality = scores.get(c.paper_id, 3)
+            factor = quality / 3.0
+            boosted.append(RetrievedChunk(
+                paper_id=c.paper_id,
+                title=c.title,
+                year=c.year,
+                journal=c.journal,
+                section=c.section,
+                text=c.text,
+                score=c.score * factor,
+                chunk_index=c.chunk_index,
+            ))
+        boosted.sort(key=lambda c: c.score, reverse=True)
+        return boosted
+
     def _format_context(self, chunks: list[RetrievedChunk]) -> str:
         parts = []
         for i, c in enumerate(chunks, 1):
@@ -122,21 +178,18 @@ class RAGChain:
         return "\n\n---\n\n".join(parts)
 
     def _extract_sources(self, chunks: list[RetrievedChunk]) -> list[dict]:
-        seen = set()
-        sources = []
+        seen = {}
         for c in chunks:
-            key = (c.paper_id, c.section)
-            if key not in seen:
-                seen.add(key)
-                sources.append({
+            if c.paper_id not in seen or c.score > seen[c.paper_id]["score"]:
+                seen[c.paper_id] = {
                     "paper_id": c.paper_id,
                     "title": c.title,
                     "year": c.year,
                     "journal": c.journal,
                     "section": c.section,
                     "score": round(c.score, 3),
-                })
-        return sources
+                }
+        return list(seen.values())
 
     def _build_prompt(self, question: str, context: str, mode: str) -> str:
         if mode == "contradiction":
@@ -146,8 +199,9 @@ class RAGChain:
             )
         elif mode == "litreview":
             question = (
-                f"Write a concise academic literature review paragraph (200-300 words) addressing: "
-                f"{question}\nUse academic prose and cite papers as (Author, Year)."
+                f"Write an academic literature review (300-500 words) addressing: "
+                f"{question}\nUse academic prose, cite papers frequently as (Author, Year), "
+                "and aim to reference as many of the provided papers as appropriate."
             )
 
         return QA_PROMPT_TEMPLATE.format(context=context, question=question)
@@ -158,10 +212,10 @@ class RAGChain:
         elif self.backend == "mlx":
             return self._generate_mlx(prompt)
 
-    def _generate_claude(self, prompt: str) -> str:
+    def _generate_claude(self, prompt: str, max_tokens: int = 2048) -> str:
         response = self.claude.messages.create(
             model=self.claude_model,
-            max_tokens=1024,
+            max_tokens=max_tokens,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )

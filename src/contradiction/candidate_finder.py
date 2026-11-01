@@ -26,6 +26,9 @@ OPPOSING_DIRECTIONS = {
     frozenset({"increase", "decrease"}),
     frozenset({"increase", "no_effect"}),
     frozenset({"decrease", "no_effect"}),
+    frozenset({"bidirectional", "increase"}),
+    frozenset({"bidirectional", "decrease"}),
+    frozenset({"bidirectional", "no_effect"}),
 }
 
 
@@ -126,8 +129,9 @@ class CandidateFinder:
                     s = json.load(f)
                 for claim in s.get("claims", []):
                     direction = claim.get("direction", "unclear")
-                    if direction in ("unclear", "bidirectional"):
-                        continue  # can't detect direction-based contradictions
+                    # Only consider quantitative directional claims for contradiction detection
+                    if direction not in {"increase", "decrease", "no_effect", "bidirectional"}:
+                        continue
                     claims.append(ClaimRecord(
                         paper_id=s["paper_id"],
                         title=s.get("title", ""),

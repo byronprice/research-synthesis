@@ -34,6 +34,8 @@ def parse_args():
     p.add_argument("--limit", type=int, default=None, help="Process only first N papers (for testing)")
     p.add_argument("--workers", type=int, default=4, help="Parallel worker processes")
     p.add_argument("--resume", action="store_true", help="Skip papers already in output files")
+    p.add_argument("--min-quality", type=float, default=None,
+                   help="With --resume, re-extract papers whose quality score is below this threshold (e.g. 0.6)")
     return p.parse_args()
 
 
@@ -72,16 +74,23 @@ def main():
         papers = papers[: args.limit]
         logger.info(f"Limited to {args.limit} papers")
 
-    # Resume: load already-processed paper IDs from fulltext output
+    # Resume: load already-processed paper IDs from fulltext output.
+    # With --min-quality, also re-extract papers below the quality threshold.
     done_ids: set[int] = set()
+    low_quality_ids: set[int] = set()
     if args.resume and fulltext_path.exists():
         with open(fulltext_path) as f:
             for line in f:
                 record = json.loads(line)
-                done_ids.add(record["paper_id"])
-        logger.info(f"Resuming: {len(done_ids)} papers already extracted")
+                pid = record["paper_id"]
+                done_ids.add(pid)
+                if args.min_quality is not None and record.get("extraction_quality", 0) < args.min_quality:
+                    low_quality_ids.add(pid)
+        logger.info(f"Resuming: {len(done_ids)} papers already extracted"
+                    + (f", {len(low_quality_ids)} below quality {args.min_quality} — will re-extract"
+                       if low_quality_ids else ""))
 
-    papers_to_process = [p for p in papers if p.paper_id not in done_ids]
+    papers_to_process = [p for p in papers if p.paper_id not in done_ids or p.paper_id in low_quality_ids]
     logger.info(f"Papers to extract: {len(papers_to_process)}")
 
     # Write metadata for ALL papers (including already-done ones) if starting fresh
@@ -91,10 +100,12 @@ def main():
                 f.write(json.dumps(paper.to_dict()) + "\n")
         logger.info(f"Wrote metadata for {len(papers)} papers → {metadata_path}")
     else:
-        # Append metadata for new papers only
+        # Append metadata for genuinely new papers only
+        new_ids = {p.paper_id for p in papers_to_process} - low_quality_ids
         with open(metadata_path, "a") as f:
             for paper in papers_to_process:
-                f.write(json.dumps(paper.to_dict()) + "\n")
+                if paper.paper_id in new_ids:
+                    f.write(json.dumps(paper.to_dict()) + "\n")
 
     if not papers_to_process:
         logger.info("Nothing to extract. Done.")
@@ -105,8 +116,7 @@ def main():
     extractor_config_dict = {
         "timeout_seconds": ec.get("timeout_seconds", 60),
         "min_text_chars": ec.get("min_text_chars", 500),
-        "max_section_chars": ec.get("max_section_chars", 8000),
-        "max_fulltext_chars": ec.get("max_fulltext_chars", 40000),
+        "max_fulltext_chars": ec.get("max_fulltext_chars", 120000),
         "strip_references": ec.get("strip_references", True),
     }
 
@@ -115,6 +125,18 @@ def main():
 
     # Stats
     stats = {"success": 0, "timeout": 0, "error": 0, "too_short": 0}
+
+    # If re-extracting low-quality papers, rewrite the file without their old records
+    if low_quality_ids and fulltext_path.exists():
+        logger.info(f"Removing {len(low_quality_ids)} low-quality records from {fulltext_path} before re-extraction")
+        lines = []
+        with open(fulltext_path) as f:
+            for line in f:
+                rec = json.loads(line)
+                if rec["paper_id"] not in low_quality_ids:
+                    lines.append(line)
+        with open(fulltext_path, "w") as f:
+            f.writelines(lines)
 
     mode = "a" if args.resume else "w"
     with open(fulltext_path, mode) as out_f:

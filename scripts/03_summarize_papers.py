@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Phase 3: Generate structured per-paper summaries via Claude API.
+Phase 3: Generate structured per-paper summaries and critical reviews via Claude API.
 
 Reads:
   data/extracted/papers_metadata.jsonl
   data/extracted/papers_fulltext.jsonl
 
 Writes:
-  data/summaries/{paper_id}.json  — one file per paper
+  data/summaries/{paper_id}.json  — structured summary (key findings, claims, methods, …)
+  data/reviews/{paper_id}.json    — free-text critical review (claims + experimental critique)
 
 Run from project root:
   python scripts/03_summarize_papers.py [--limit N] [--resume] [--model MODEL]
@@ -28,6 +29,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.summarization.per_paper import PaperSummarizer
+from src.summarization.review import PaperReviewer
 
 
 def parse_args():
@@ -35,11 +37,12 @@ def parse_args():
     p.add_argument("--metadata", default="data/extracted/papers_metadata.jsonl")
     p.add_argument("--fulltext", default="data/extracted/papers_fulltext.jsonl")
     p.add_argument("--output-dir", default="data/summaries")
+    p.add_argument("--reviews-dir", default="data/reviews")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--resume", action="store_true", help="Skip already-summarized papers")
     p.add_argument(
         "--model",
-        default="claude-haiku-4-5-20251001",
+        default="claude-sonnet-4-6",
         help="Claude model to use (haiku=cheap, sonnet=better quality)",
     )
     p.add_argument("--api-key", default=None, help="Anthropic API key (or set ANTHROPIC_API_KEY)")
@@ -66,6 +69,8 @@ def main():
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    reviews_dir = Path(args.reviews_dir)
+    reviews_dir.mkdir(parents=True, exist_ok=True)
 
     metadata = load_jsonl(args.metadata)
     fulltext = load_jsonl(args.fulltext)
@@ -75,11 +80,12 @@ def main():
         paper_ids = paper_ids[: args.limit]
 
     if args.resume:
-        existing = {int(p.stem) for p in out_dir.glob("*.json")}
+        existing = {int(p.stem) for p in out_dir.glob("*.json")} & \
+                   {int(p.stem) for p in reviews_dir.glob("*.json")}
         paper_ids = [pid for pid in paper_ids if pid not in existing]
-        logger.info(f"Resuming: {len(existing)} already done, {len(paper_ids)} remaining")
+        logger.info(f"Resuming: {len(existing)} fully done, {len(paper_ids)} remaining")
 
-    logger.info(f"Summarizing {len(paper_ids)} papers with {args.model}")
+    logger.info(f"Summarizing + reviewing {len(paper_ids)} papers with {args.model}")
 
     api_key = args.api_key or os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -87,6 +93,7 @@ def main():
         sys.exit(1)
 
     summarizer = PaperSummarizer(api_key=api_key, model=args.model)
+    reviewer = PaperReviewer(api_key=api_key, model=args.model)
 
     stats = {"success": 0, "skipped": 0, "failed": 0}
 
@@ -99,26 +106,35 @@ def main():
             stats["skipped"] += 1
             continue
 
-        summary = summarizer.summarize(meta, ft)
-        if summary is None:
-            stats["failed"] += 1
-            continue
+        # --- Structured summary ---
+        summary_path = out_dir / f"{pid}.json"
+        if not summary_path.exists():
+            summary = summarizer.summarize(meta, ft)
+            if summary is None:
+                stats["failed"] += 1
+                continue
+            with open(summary_path, "w") as f:
+                json.dump(summary.model_dump(), f, indent=2)
+            if args.delay > 0:
+                time.sleep(args.delay)
 
-        out_path = out_dir / f"{pid}.json"
-        with open(out_path, "w") as f:
-            json.dump(summary.model_dump(), f, indent=2)
+        # --- Critical review ---
+        review_path = reviews_dir / f"{pid}.json"
+        if not review_path.exists():
+            paper_review = reviewer.review(meta, ft)
+            if paper_review is None:
+                stats["failed"] += 1
+                continue
+            with open(review_path, "w") as f:
+                json.dump(paper_review.to_dict(), f, indent=2)
+            if args.delay > 0:
+                time.sleep(args.delay)
+
         stats["success"] += 1
-
-        if args.delay > 0:
-            time.sleep(args.delay)
 
     logger.info(
         f"Done. Success: {stats['success']}, Skipped: {stats['skipped']}, Failed: {stats['failed']}"
     )
-    # Rough cost estimate for haiku
-    if "haiku" in args.model:
-        cost_estimate = stats["success"] * 0.004
-        logger.info(f"Estimated API cost (claude-haiku): ~${cost_estimate:.2f}")
 
 
 if __name__ == "__main__":

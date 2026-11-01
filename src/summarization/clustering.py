@@ -1,18 +1,28 @@
 """
-Cluster paper summaries into topic groups using UMAP + HDBSCAN.
+Claim-level clustering for cross-paper synthesis.
 
-Embeds each paper's title + key_findings + keywords (not full text)
-to get a topic-level representation, then clusters.
+Loads structured claims from both per-paper summaries (data/summaries/)
+and critical reviews (data/reviews/), embeds claim text, then clusters
+using UMAP + HDBSCAN to find groups of related claims across papers.
 
-Zotero collection memberships are used as validation labels.
+Claims from summaries carry: direction, quantitative, conditions.
+Claims from reviews carry: verdict, ideal_experiments, paper_justification, required_experiments.
+
+Output:
+  data/clusters/claim_assignments.jsonl  — one record per claim with cluster_id
+  data/clusters/cluster_index.json       — {cluster_id: [claim indices]} index
 
 Usage:
-    clusterer = PaperClusterer(embedder)
-    assignments = clusterer.cluster(summaries_dir="data/summaries")
-    # assignments: {paper_id: cluster_id, ...}  (-1 = noise/unclustered)
+    clusterer = ClaimClusterer(embedder)
+    claims, labels = clusterer.cluster(
+        summaries_dir="data/summaries",
+        reviews_dir="data/reviews",
+        metadata_path="data/extracted/papers_metadata.jsonl",
+    )
 """
 
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -22,115 +32,197 @@ from loguru import logger
 from src.embedding.embedder import Embedder
 
 
-class PaperClusterer:
+@dataclass
+class UnifiedClaim:
+    paper_id: int
+    title: str
+    year: str
+    journal: str
+    collections: list[str]
+    claim_text: str
+    source: str              # "summary" | "review"
+    # Summary-only fields (empty string if source == "review")
+    direction: str = ""
+    quantitative: str = ""
+    conditions: str = ""
+    # Review-only fields (empty string if source == "summary")
+    verdict: str = ""        # justified | partially_justified | not_justified
+    ideal_experiments: str = ""
+    paper_justification: str = ""
+    required_experiments: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "paper_id": self.paper_id,
+            "title": self.title,
+            "year": self.year,
+            "journal": self.journal,
+            "collections": self.collections,
+            "claim_text": self.claim_text,
+            "source": self.source,
+            "direction": self.direction,
+            "quantitative": self.quantitative,
+            "conditions": self.conditions,
+            "verdict": self.verdict,
+            "ideal_experiments": self.ideal_experiments,
+            "paper_justification": self.paper_justification,
+            "required_experiments": self.required_experiments,
+        }
+
+
+class ClaimClusterer:
     def __init__(
         self,
         embedder: Embedder,
         umap_components: int = 10,
-        umap_metric: str = "cosine",
-        hdbscan_min_cluster_size: int = 8,
+        umap_neighbors: int = 15,
+        hdbscan_min_cluster_size: int = 5,
         hdbscan_min_samples: int = 3,
-        random_state: int = 42,
     ):
         self.embedder = embedder
         self.umap_components = umap_components
-        self.umap_metric = umap_metric
+        self.umap_neighbors = umap_neighbors
         self.hdbscan_min_cluster_size = hdbscan_min_cluster_size
         self.hdbscan_min_samples = hdbscan_min_samples
-        self.random_state = random_state
 
-    def cluster(self, summaries_dir: str) -> dict[int, int]:
+    def cluster(
+        self,
+        summaries_dir: str = "data/summaries",
+        reviews_dir: str = "data/reviews",
+        metadata_path: str = "data/extracted/papers_metadata.jsonl",
+    ) -> tuple[list[UnifiedClaim], np.ndarray]:
         """
-        Load all summaries, embed, cluster, return {paper_id: cluster_id}.
-        cluster_id == -1 means noise (unclustered).
+        Load claims, embed, and cluster.
+        Returns (claims, cluster_labels) where labels[i] is the cluster id
+        for claims[i]. Noise points are labeled -1.
         """
-        summaries = self._load_summaries(summaries_dir)
-        if not summaries:
-            raise ValueError(f"No summaries found in {summaries_dir}")
+        metadata = self._load_metadata(metadata_path)
+        claims = self._load_claims(summaries_dir, reviews_dir, metadata)
+        logger.info(f"Loaded {len(claims)} claims total "
+                    f"({sum(1 for c in claims if c.source == 'summary')} summary, "
+                    f"{sum(1 for c in claims if c.source == 'review')} review)")
 
-        logger.info(f"Clustering {len(summaries)} paper summaries")
+        if len(claims) < self.hdbscan_min_cluster_size:
+            logger.error("Not enough claims to cluster")
+            return claims, np.full(len(claims), -1)
 
-        paper_ids = [s["paper_id"] for s in summaries]
-        texts = [self._summary_to_text(s) for s in summaries]
-
-        # Embed
-        logger.info("Embedding summaries for clustering...")
+        texts = [c.claim_text for c in claims]
+        logger.info("Embedding claims...")
         embeddings = self.embedder.embed_documents(texts)
 
-        # UMAP dimensionality reduction
-        logger.info(f"Running UMAP (n_components={self.umap_components})...")
-        try:
-            import umap
-        except ImportError:
-            raise ImportError("Install umap-learn: pip install umap-learn")
-
+        logger.info("Running UMAP...")
+        import umap
         reducer = umap.UMAP(
             n_components=self.umap_components,
-            metric=self.umap_metric,
-            random_state=self.random_state,
-            low_memory=True,
+            n_neighbors=self.umap_neighbors,
+            metric="cosine",
+            min_dist=0.1,
+            random_state=42,
         )
         reduced = reducer.fit_transform(embeddings)
 
-        # HDBSCAN clustering
-        # Prefer sklearn's built-in HDBSCAN (no numba/llvmlite dependency).
-        # Fall back to standalone hdbscan package if sklearn < 1.3.
-        logger.info("Running HDBSCAN clustering...")
-        try:
-            from sklearn.cluster import HDBSCAN as SklearnHDBSCAN
-            clusterer = SklearnHDBSCAN(
-                min_cluster_size=self.hdbscan_min_cluster_size,
-                min_samples=self.hdbscan_min_samples,
-                metric="euclidean",
-                cluster_selection_method="eom",
-            )
-            labels = clusterer.fit_predict(reduced)
-        except ImportError:
-            try:
-                import hdbscan
-                clusterer = hdbscan.HDBSCAN(
-                    min_cluster_size=self.hdbscan_min_cluster_size,
-                    min_samples=self.hdbscan_min_samples,
-                    metric="euclidean",
-                    cluster_selection_method="eom",
-                )
-                labels = clusterer.fit_predict(reduced)
-            except ImportError:
-                raise ImportError(
-                    "HDBSCAN not available. Either upgrade scikit-learn >= 1.3 or:\n"
-                    "  conda install -c conda-forge numba llvmlite\n"
-                    "  pip install hdbscan"
-                )
+        logger.info("Running HDBSCAN...")
+        import hdbscan
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=self.hdbscan_min_cluster_size,
+            min_samples=self.hdbscan_min_samples,
+            metric="euclidean",
+        )
+        labels = clusterer.fit_predict(reduced)
 
         n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-        n_noise = (labels == -1).sum()
+        n_noise = int((labels == -1).sum())
         logger.info(f"Found {n_clusters} clusters, {n_noise} noise points")
+        return claims, labels
 
-        assignments = {pid: int(label) for pid, label in zip(paper_ids, labels)}
+    def _load_metadata(self, metadata_path: str) -> dict[int, dict]:
+        """Return {paper_id: {collections, title, year, journal}} from metadata JSONL."""
+        meta = {}
+        path = Path(metadata_path)
+        if not path.exists():
+            logger.warning(f"Metadata file not found: {metadata_path}")
+            return meta
+        with open(path) as f:
+            for line in f:
+                rec = json.loads(line)
+                pid = rec.get("paper_id")
+                if pid is not None:
+                    meta[int(pid)] = {
+                        "collections": rec.get("collections", []),
+                        "title": rec.get("title", ""),
+                        "year": rec.get("year", ""),
+                        "journal": rec.get("journal", ""),
+                    }
+        return meta
 
-        # Log cluster sizes
-        from collections import Counter
-        counts = Counter(labels)
-        for cluster_id, count in sorted(counts.items()):
-            tag = "noise" if cluster_id == -1 else f"cluster_{cluster_id}"
-            logger.debug(f"  {tag}: {count} papers")
+    def _load_claims(
+        self,
+        summaries_dir: str,
+        reviews_dir: str,
+        metadata: dict[int, dict],
+    ) -> list[UnifiedClaim]:
+        claims = []
+        claims.extend(self._load_summary_claims(summaries_dir, metadata))
+        claims.extend(self._load_review_claims(reviews_dir, metadata))
+        return claims
 
-        return assignments
-
-    def _load_summaries(self, summaries_dir: str) -> list[dict]:
-        path = Path(summaries_dir)
-        summaries = []
-        for fpath in sorted(path.glob("*.json")):
+    def _load_summary_claims(
+        self, summaries_dir: str, metadata: dict[int, dict]
+    ) -> list[UnifiedClaim]:
+        claims = []
+        for fpath in sorted(Path(summaries_dir).glob("*.json")):
             try:
                 with open(fpath) as f:
-                    summaries.append(json.load(f))
+                    s = json.load(f)
+                pid = int(s["paper_id"])
+                meta = metadata.get(pid, {})
+                for claim in s.get("claims", []):
+                    text = claim.get("claim", "").strip()
+                    if not text:
+                        continue
+                    claims.append(UnifiedClaim(
+                        paper_id=pid,
+                        title=s.get("title", meta.get("title", "")),
+                        year=s.get("year", meta.get("year", "")),
+                        journal=s.get("journal", meta.get("journal", "")),
+                        collections=meta.get("collections", []),
+                        claim_text=text,
+                        source="summary",
+                        direction=claim.get("direction", ""),
+                        quantitative=claim.get("quantitative", ""),
+                        conditions=claim.get("conditions", ""),
+                    ))
             except Exception as e:
-                logger.warning(f"Could not load {fpath}: {e}")
-        return summaries
+                logger.warning(f"Could not load summary {fpath}: {e}")
+        return claims
 
-    def _summary_to_text(self, summary: dict) -> str:
-        """Combine title + findings + keywords into a topic-representative string."""
-        parts = [summary.get("title", "")]
-        parts.extend(summary.get("key_findings", []))
-        parts.extend(summary.get("keywords", []))
-        return " ".join(p for p in parts if p)
+    def _load_review_claims(
+        self, reviews_dir: str, metadata: dict[int, dict]
+    ) -> list[UnifiedClaim]:
+        claims = []
+        for fpath in sorted(Path(reviews_dir).glob("*.json")):
+            try:
+                with open(fpath) as f:
+                    r = json.load(f)
+                pid = int(r["paper_id"])
+                meta = metadata.get(pid, {})
+                for claim in r.get("claims", []):
+                    text = claim.get("claim", "").strip()
+                    if not text:
+                        continue
+                    claims.append(UnifiedClaim(
+                        paper_id=pid,
+                        title=r.get("title", meta.get("title", "")),
+                        year=r.get("year", meta.get("year", "")),
+                        journal=r.get("journal", meta.get("journal", "")),
+                        collections=meta.get("collections", []),
+                        claim_text=text,
+                        source="review",
+                        verdict=claim.get("verdict", ""),
+                        ideal_experiments=claim.get("ideal_experiments", ""),
+                        paper_justification=claim.get("paper_justification", ""),
+                        required_experiments=claim.get("required_experiments", ""),
+                    ))
+            except Exception as e:
+                logger.warning(f"Could not load review {fpath}: {e}")
+        return claims

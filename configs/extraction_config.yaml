@@ -33,7 +33,5 @@ extraction:
     - supplemental
   # Strip reference section text from full_text
   strip_references: true
-  # Max chars to store per section (avoid bloat from very long results sections)
-  max_section_chars: 8000
-  # Max chars for full_text field
-  max_fulltext_chars: 40000
+  # Max chars for full_text field (sections are only truncated if their total exceeds this)
+  max_fulltext_chars: 120000

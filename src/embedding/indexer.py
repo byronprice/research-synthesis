@@ -99,10 +99,16 @@ class Indexer:
         embedder: Embedder,
         batch_size: int = 64,
         skip_existing: bool = True,
+        reindex_ids: Optional[set[int]] = None,
     ):
         """
         Load metadata + fulltext JSONL, generate chunks, embed, and upsert into Qdrant.
+
+        reindex_ids: paper IDs to delete and re-index even if already present
+                     (used after re-extracting low-quality papers).
         """
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+
         # Load metadata keyed by paper_id
         meta: dict[int, dict] = {}
         with open(metadata_path) as f:
@@ -110,11 +116,23 @@ class Indexer:
                 rec = json.loads(line)
                 meta[rec["paper_id"]] = rec
 
+        # Delete old chunks for papers being re-indexed
+        if reindex_ids:
+            logger.info(f"Deleting old chunks for {len(reindex_ids)} re-indexed papers...")
+            for pid in reindex_ids:
+                try:
+                    self.client.delete(
+                        collection_name=COLLECTION_NAME,
+                        points_selector=Filter(
+                            must=[FieldCondition(key="paper_id", match=MatchValue(value=pid))]
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not delete chunks for paper {pid}: {e}")
+
         # Get already-indexed paper IDs if resuming
         existing_ids: set[int] = set()
         if skip_existing:
-            # Scroll through collection to find indexed paper IDs
-            # For large collections use scroll API
             try:
                 result = self.client.scroll(
                     collection_name=COLLECTION_NAME,
@@ -124,6 +142,9 @@ class Indexer:
                 )
                 for point in result[0]:
                     existing_ids.add(point.payload["paper_id"])
+                # Don't skip papers we're meant to re-index
+                if reindex_ids:
+                    existing_ids -= reindex_ids
                 logger.info(f"Found {len(existing_ids)} already-indexed papers")
             except Exception:
                 pass

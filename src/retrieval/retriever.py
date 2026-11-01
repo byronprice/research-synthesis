@@ -10,6 +10,7 @@ Usage:
     )
 """
 
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -36,7 +37,9 @@ class RetrievedChunk:
 
 class Retriever:
     def __init__(self, qdrant_path: str, embedder: Embedder):
-        self.client = QdrantClient(path=qdrant_path)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.client = QdrantClient(path=qdrant_path)
         self.embedder = embedder
 
     def retrieve(
@@ -58,16 +61,16 @@ class Retriever:
         query_vec = self.embedder.embed_query(query)
         qdrant_filter = self._build_filter(filters) if filters else None
 
-        results = self.client.search(
+        response = self.client.query_points(
             collection_name=COLLECTION_NAME,
-            query_vector=query_vec.tolist(),
+            query=query_vec.tolist(),
             limit=top_k,
             query_filter=qdrant_filter,
             with_payload=True,
         )
 
         chunks = []
-        for r in results:
+        for r in response.points:
             p = r.payload
             chunks.append(RetrievedChunk(
                 chunk_id=p.get("chunk_id", ""),
@@ -116,5 +119,4 @@ class Retriever:
         if not conditions:
             return None
 
-        from qdrant_client.models import Filter as QFilter, Must
         return Filter(must=conditions)

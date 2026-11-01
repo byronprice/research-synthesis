@@ -14,6 +14,7 @@ Run from project root:
 """
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -39,6 +40,8 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=8,
                    help="Embedding batch size (lower = less RAM; default 8 for M1)")
     p.add_argument("--resume", action="store_true", help="Skip already-indexed papers")
+    p.add_argument("--reindex-below-quality", type=float, default=None,
+                   help="Delete and re-index papers whose extraction quality is below this threshold")
     p.add_argument("--device", default="cpu",
                    help="Device for embedding model: cpu | cuda | mps (default: cpu)")
     return p.parse_args()
@@ -64,6 +67,17 @@ def main():
         device=args.device,
     )
 
+    # Find paper IDs to force re-index based on quality threshold
+    reindex_ids = None
+    if args.reindex_below_quality is not None and Path(args.fulltext).exists():
+        reindex_ids = set()
+        with open(args.fulltext) as f:
+            for line in f:
+                rec = json.loads(line)
+                if rec.get("extraction_quality", 0) < args.reindex_below_quality:
+                    reindex_ids.add(rec["paper_id"])
+        logger.info(f"Will re-index {len(reindex_ids)} papers below quality {args.reindex_below_quality}")
+
     indexer = Indexer(qdrant_path=args.qdrant_path)
     indexer.index_papers(
         metadata_path=args.metadata,
@@ -71,6 +85,7 @@ def main():
         embedder=embedder,
         batch_size=args.batch_size,
         skip_existing=args.resume,
+        reindex_ids=reindex_ids,
     )
 
     # Quick sanity check — reuse the indexer's open client to avoid lock conflict
